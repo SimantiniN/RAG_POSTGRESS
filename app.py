@@ -3,15 +3,15 @@ PharmaPal-AI Clinical Dashboard - Main Application Entrypoint
 Provides global patient and admission selection with clinical snapshot metrics.
 """
 
-import os
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
 
-from services.clinical_queries import get_diagnoses
+from db import get_engine, verify_db_connection
+from services.clinical_queries import get_patient_admissions, get_diagnoses
 
 load_dotenv()
+fetch_valid_admissions = get_patient_admissions
 
 # Page Configuration
 st.set_page_config(
@@ -52,47 +52,34 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Database Connection Engine
-@st.cache_resource
-def get_db_engine():
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:sql@localhost:5432/MIMIC")
-    return create_engine(db_url, pool_pre_ping=True)
-
-engine = get_db_engine()
-
-# Fetch populated admissions directly from labevents & prescriptions_new_clean
-@st.cache_data(ttl=300, show_spinner="Fetching patient admissions details...")
-def fetch_valid_admissions(_eng) -> pd.DataFrame:
-    query = """
-        SELECT DISTINCT 
-            l.subject_id, 
-            l.hadm_id, 
-            COUNT(DISTINCT l.itemid) AS total_labs,
-            COUNT(DISTINCT p.drug) AS total_meds
-        FROM labevents l
-        JOIN prescriptions_new_clean p 
-          ON l.subject_id = p.subject_id 
-         AND l.hadm_id = p.hadm_id
-        GROUP BY l.subject_id, l.hadm_id
-        HAVING COUNT(DISTINCT l.itemid) > 5 
-           AND COUNT(DISTINCT p.drug) > 2
-        ORDER BY l.subject_id ASC, total_labs DESC
-        LIMIT 100;
-    """
-    try:
-        return pd.read_sql(query, _eng)
-    except Exception:
-        fallback_query = "SELECT DISTINCT subject_id, hadm_id, 0 as total_labs, 0 as total_meds FROM admissions LIMIT 20;"
-        return pd.read_sql(fallback_query, _eng)
-
-valid_admissions_df = fetch_valid_admissions(engine)
-
-# Title & Header
+# Render Header first to ensure immediate page loading
 st.title("💊 PharmaPal-AI: Clinical RAG Assistant")
-
 st.header("Patient & Admission Selection")
 
-if not valid_admissions_df.empty:
+# Verify Database Connection status using db.py module
+is_connected, db_status_msg = verify_db_connection()
+if not is_connected:
+    st.error(f"⚠️ {db_status_msg}")
+    st.info("Ensure local PostgreSQL server is running and `DATABASE_URL` in `.env` is correct.")
+    st.stop()
+
+# Obtain cached database engine from db.py
+engine = get_engine()
+
+# Safe data loading with visual loader
+@st.cache_data(ttl=300, show_spinner=False)
+def load_admissions_data(_eng):
+    try:
+        return fetch_valid_admissions(_eng)
+    except Exception as err:
+        st.warning(f"Could not load dynamic admissions cohort: {err}")
+        return pd.DataFrame()
+
+with st.spinner("Loading patient admissions..."):
+    valid_admissions_df = load_admissions_data(engine)
+
+# Cohort Selection Logic
+if valid_admissions_df is not None and not valid_admissions_df.empty:
     # Normalize column names to lowercase
     valid_admissions_df.columns = [str(c).lower().strip() for c in valid_admissions_df.columns]
     valid_admissions_df["subject_id"] = valid_admissions_df["subject_id"].astype("int64")
@@ -138,8 +125,12 @@ if not valid_admissions_df.empty:
     subject_id = int(selected_subject_id)
     hadm_id = int(selected_hadm_id)
 else:
-    subject_id = st.number_input("Subject ID", value=10001884, step=1)
-    hadm_id = st.number_input("Admission ID (HADM_ID)", value=24746267, step=1)
+    st.warning("⚠️ No cohort admissions returned from database. Falling back to default ID selection.")
+    col1, col2 = st.columns(2)
+    with col1:
+        subject_id = st.number_input("Subject ID", value=10001884, step=1)
+    with col2:
+        hadm_id = st.number_input("Admission ID (HADM_ID)", value=24746267, step=1)
 
 # Persist selected patient/admission globally across secondary pages
 st.session_state["subject_id"] = int(subject_id)
@@ -147,10 +138,43 @@ st.session_state["hadm_id"] = int(hadm_id)
 
 st.divider()
 
-# High-Contrast Metric Context Cards
-col_p, col_a = st.columns(2)
+# --------------------------------------------------------------------------
+# Patient Vital Status Calculation
+# --------------------------------------------------------------------------
+current_admission_df = pd.DataFrame()
+if valid_admissions_df is not None and not valid_admissions_df.empty:
+    current_admission_df = valid_admissions_df[
+        (valid_admissions_df["subject_id"] == subject_id) & 
+        (valid_admissions_df["hadm_id"] == hadm_id)
+    ]
+
+vital_status_label = "🟢 ALIVE"
+expire_detail = "Discharged Home / Facilities"
+
+if not current_admission_df.empty:
+    row = current_admission_df.iloc[0]
+    
+    is_expired = (
+        (row.get("hospital_expire_flag") == 1) or 
+        pd.notna(row.get("dod")) or 
+        pd.notna(row.get("deathtime"))
+    )
+    
+    if is_expired:
+        vital_status_label = "🔴 DECEASED"
+        if row.get("hospital_expire_flag") == 1:
+            deathtime_val = row.get("deathtime", "N/A")
+            expire_detail = f"In-Hospital Expired: {deathtime_val}"
+        elif pd.notna(row.get("dod")):
+            expire_detail = f"Date of Death: {row.get('dod')}"
+
+# --------------------------------------------------------------------------
+# Dynamic Metric Context Cards (Top Bar)
+# --------------------------------------------------------------------------
+col_p, col_a, col_s = st.columns(3)
 col_p.metric("SELECTED PATIENT", f"{subject_id}")
 col_a.metric("SELECTED ADMISSION", f"{hadm_id}")
+col_s.metric("PATIENT VITAL STATUS", vital_status_label, delta=expire_detail, delta_color="off")
 
 st.divider()
 
@@ -159,7 +183,11 @@ st.divider()
 # --------------------------------------------------------------------------
 st.markdown("### 🔍 Admission Diagnoses Overview")
 
-diagnoses_df = get_diagnoses(engine, subject_id, hadm_id)
+try:
+    diagnoses_df = get_diagnoses(engine, subject_id, hadm_id)
+except Exception as e:
+    st.error(f"Error retrieving diagnoses: {e}")
+    diagnoses_df = pd.DataFrame()
 
 if diagnoses_df is not None and not diagnoses_df.empty:
     total_dx = len(diagnoses_df)

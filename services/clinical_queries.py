@@ -1,11 +1,22 @@
 """
 Database Query Service for PharmaPal-AI.
 Fetches structured patient profiles, diagnoses, lab events, prescriptions,
-and clinical evidence directly from PostgreSQL.
+and pgvector semantic clinical evidence directly from PostgreSQL.
 """
 
 import pandas as pd
+import streamlit as st
 from sqlalchemy import inspect, text
+from sentence_transformers import SentenceTransformer
+
+
+# --------------------------------------------------------------------------
+# Embedding Model Cache for pgvector
+# --------------------------------------------------------------------------
+@st.cache_resource
+def load_embed_model():
+    """Loads the sentence transformer model once for vector search."""
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
 
 def get_patient_profile(engine, subject_id: int, hadm_id: int) -> pd.DataFrame:
@@ -31,35 +42,77 @@ def get_patient_profile(engine, subject_id: int, hadm_id: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# def get_patient_admissions(engine, subject_id: int = None) -> pd.DataFrame:
+#     """Retrieve patient admissions along with mortality status."""
+#     if subject_id:
+#         sql = text("""
+#             SELECT 
+#                 a.subject_id,
+#                 a.hadm_id, 
+#                 a.admission_type, 
+#                 a.admission_location, 
+#                 a.race,
+#                 a.admittime,
+#                 a.dischtime,
+#                 a.deathtime,
+#                 a.hospital_expire_flag,
+#                 p.dod,
+#                 p.gender
+#             FROM admissions a
+#             JOIN patients p ON a.subject_id = p.subject_id
+#             WHERE a.subject_id = :subject_id
+#             ORDER BY a.hadm_id DESC;
+#         """)
+#         params = {"subject_id": subject_id}
+#     else:
+#         # Cohort overview fallback query
+#         sql = text("""
+#             SELECT 
+#                 a.subject_id, 
+#                 a.hadm_id, 
+#                 a.hospital_expire_flag,
+#                 p.dod
+#             FROM admissions a
+#             JOIN patients p ON a.subject_id = p.subject_id
+#             ORDER BY a.subject_id ASC
+#             LIMIT 100;
+#         """)
+#         params = {}
 def get_patient_admissions(engine, subject_id: int = None) -> pd.DataFrame:
-    """Retrieve admissions dynamically for a subject or fetch populated test admissions."""
+    """Retrieve patient admissions along with mortality status."""
     if subject_id:
         sql = text("""
-            SELECT hadm_id, admission_type, admission_location, race 
-            FROM admissions 
-            WHERE subject_id = :subject_id
-            ORDER BY hadm_id DESC;
+            SELECT 
+                a.subject_id,
+                a.hadm_id, 
+                a.admission_type, 
+                a.admission_location, 
+                a.race,
+                a.admittime,
+                a.dischtime,
+                a.deathtime,
+                a.hospital_expire_flag,
+                p.dod,
+                p.gender
+            FROM admissions a
+            JOIN patients p ON a.subject_id = p.subject_id
+            WHERE a.subject_id = :subject_id
+            ORDER BY a.hadm_id DESC;
         """)
         params = {"subject_id": subject_id}
     else:
+        # Load ALL admissions and patients without limiting to 100
         sql = text("""
-            SELECT DISTINCT 
-                l.subject_id, 
-                l.hadm_id, 
-                COUNT(DISTINCT l.itemid) AS total_labs,
-                COUNT(DISTINCT p.drug) AS total_meds
-            FROM labevents l
-            JOIN prescriptions_new_clean p 
-              ON l.subject_id = p.subject_id 
-             AND l.hadm_id = p.hadm_id
-            GROUP BY l.subject_id, l.hadm_id
-            HAVING COUNT(DISTINCT l.itemid) > 5 
-               AND COUNT(DISTINCT p.drug) > 2
-            ORDER BY total_labs DESC
-            LIMIT 50;
+            SELECT 
+                a.subject_id, 
+                a.hadm_id, 
+                a.hospital_expire_flag,
+                p.dod
+            FROM admissions a
+            JOIN patients p ON a.subject_id = p.subject_id
+            ORDER BY a.subject_id ASC;
         """)
         params = {}
-        
     try:
         with engine.connect() as conn:
             return pd.read_sql(sql, conn, params=params)
@@ -206,6 +259,7 @@ def get_lab_summary(engine, subject_id: int, hadm_id: int) -> pd.DataFrame:
         print(f"[Warning] Error fetching lab summary from view: {err}")
         return pd.DataFrame()
 
+
 def get_lab_history(engine, subject_id: int, hadm_id: int, itemid: int = None) -> pd.DataFrame:
     """Retrieve longitudinal sequence of lab results for plotting and analysis."""
     if itemid:
@@ -247,6 +301,42 @@ def get_lab_history(engine, subject_id: int, hadm_id: int, itemid: int = None) -
             return pd.read_sql(sql, conn, params=params)
     except Exception as err:
         print(f"[Warning] Error fetching lab history: {err}")
+        return pd.DataFrame()
+
+
+def retrieve_vector_context(engine, question: str, subject_id: int, hadm_id: int, top_k: int = 5) -> pd.DataFrame:
+    """
+    Retrieves semantic clinical passage embeddings directly from PostgreSQL 
+    using the pgvector cosine distance operator (<=>) filtered by patient admission.
+    """
+    model = load_embed_model()
+    query_vector = model.encode(question).tolist()
+    
+    sql = text("""
+        SELECT 
+            content, 
+            source_table, 
+            (embedding <=> :query_vector::vector) AS distance
+        FROM clinical_embeddings
+        WHERE subject_id = :subject_id AND hadm_id = :hadm_id
+        ORDER BY distance ASC
+        LIMIT :top_k;
+    """)
+    
+    try:
+        with engine.connect() as conn:
+            return pd.read_sql(
+                sql, 
+                conn, 
+                params={
+                    "query_vector": str(query_vector), 
+                    "subject_id": int(subject_id), 
+                    "hadm_id": int(hadm_id), 
+                    "top_k": int(top_k)
+                }
+            )
+    except Exception as err:
+        print(f"[Warning] Error executing pgvector retrieval: {err}")
         return pd.DataFrame()
 
 

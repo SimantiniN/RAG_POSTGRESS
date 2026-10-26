@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------
+  # 1. PostgreSQL Database with pgvector pre-installed
+  # ---------------------------------------------------------
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: pharmapal_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sql
+      POSTGRES_DB: MIMIC
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d MIMIC"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------
+  # 2. Local Ollama LLM Engine for RAG
+  # ---------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pharmapal_ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  # ---------------------------------------------------------
+  # 3. Streamlit PharmaPal-AI Application
+  # ---------------------------------------------------------
+  web:
+    build: .
+    container_name: pharmapal_web
+    restart: always
+    ports:
+      - "8502:8502"
+    environment:
+      - DATABASE_URL=postgresql://postgres:sql@db:5432/MIMIC
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  ollama_data:
